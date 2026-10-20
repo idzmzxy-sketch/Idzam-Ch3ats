@@ -1,20 +1,211 @@
 --[[
-    Idzam Ch3atz v3 — Steal An Egg
-    target : Roblox, executor (Delta / Xeno / Wave / Solara / Krnl)
-    source : mekanik game dari wiki + script publik (bypass.tools, delta-scripts, scriptverse)
-    note   : remote name di-derive otomatis dari ReplicatedStorage. kalau gagal, fallback ke ProximityPrompt.
+    Idzam Ch3atz v5 — Steal An Egg
+    target : Roblox, executor (Delta / Xeno / Wave / Solara / Krnl / Synapse)
+    require: getgc, hookmetamethod, hookfunction, newcclosure, getconnections, gethui
+    catatan: kalau executor lu gak punya salah satu fungsi di atas, blok bypass
+             otomatis di-skip — script tetap jalan tanpa bypass itu.
+    mode   : stealth + bypass aktif default. set Config.Stealth.Enabled = false
+             dan Bypass_Enabled = false kalau main di private server sendiri.
 ]]
+
+-- ============================================================
+-- BYPASS LAYER
+-- ============================================================
+local Bypass_Enabled = true
+
+local Bypass = {}
+do
+    local function has(fn) return type(fn) == "function" end
+    local function safe_call(fn, ...)
+        local ok, res = pcall(fn, ...)
+        if ok then return res end
+        return nil
+    end
+
+    local AC_KEYWORDS = {
+        "anticheat", "anti_cheat", "anti-cheat", "ac_", "_ac",
+        "detect", "report", "memer", "guard", "monitor", "integrity",
+        "byfron", "hyperion", "iac", "adonis", "watchdog",
+    }
+
+    local function looksLikeAC(name)
+        local l = tostring(name):lower()
+        for _, kw in ipairs(AC_KEYWORDS) do
+            if l:find(kw, 1, true) then return true end
+        end
+        return false
+    end
+
+    local hooked_tables = {}
+    local function isACTable(t)
+        if type(t) ~= "table" then return false end
+        if type(rawget(t, "Detected")) == "function" then return true end
+        if type(rawget(t, "Kill")) == "function"
+            and rawget(t, "Variables") and rawget(t, "Process") then return true end
+        return false
+    end
+
+    local function neutraliseTable(t)
+        if hooked_tables[t] then return end
+        hooked_tables[t] = true
+        for _, key in ipairs({"Detected", "Report"}) do
+            local fn = rawget(t, key)
+            if type(fn) == "function" and has(hookfunction) then
+                safe_call(hookfunction, fn, function() return true end)
+            end
+        end
+        local kill = rawget(t, "Kill")
+        if type(kill) == "function" and has(hookfunction) then
+            safe_call(hookfunction, kill, function() end)
+        end
+    end
+
+    local disabled_threads = 0
+
+    local function scanGC()
+        if not has(getgc) then return end
+        local ok, gc = pcall(getgc, true)
+        if not ok then return end
+        for _, obj in ipairs(gc) do
+            if isACTable(obj) then
+                neutraliseTable(obj)
+                disabled_threads = disabled_threads + 1
+            end
+        end
+    end
+
+    local function killACThreads()
+        if not has(getgc) then return end
+        local ok, gc = pcall(getgc, true)
+        if not ok then return end
+        for _, thread in ipairs(gc) do
+            if type(thread) == "thread" and coroutine.status(thread) ~= "dead" then
+                local info = safe_call(debug.info, thread, "s")
+                if type(info) == "string" and looksLikeAC(info) then
+                    safe_call(coroutine.close, thread)
+                    disabled_threads = disabled_threads + 1
+                end
+            end
+        end
+    end
+
+    local ac_remotes = {}
+    local function classifyRemotes()
+        local RS = game:GetService("ReplicatedStorage")
+        local ok, desc = pcall(function() return RS:GetDescendants() end)
+        if not ok then return end
+        for _, obj in ipairs(desc) do
+            if (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction"))
+                and looksLikeAC(obj.Name) then
+                ac_remotes[obj] = true
+            end
+        end
+    end
+
+    local function hookNamecall()
+        if not has(hookmetamethod) then return end
+        local old
+        old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            local method = getnamecallmethod()
+            if method == "FireServer" or method == "InvokeServer" then
+                if ac_remotes[self] then return nil end
+                local ok, name = pcall(function() return self.Name end)
+                if ok and looksLikeAC(name) then return nil end
+            end
+            return old(self, ...)
+        end))
+    end
+
+    local real_props = { WalkSpeed = {}, JumpPower = {} }
+
+    local function hookProperties()
+        if not has(hookmetamethod) then return end
+        local oldIndex
+        oldIndex = hookmetamethod(game, "__index", newcclosure(function(self, key)
+            local value = oldIndex(self, key)
+            if not checkcaller() and typeof(self) == "Instance" and self:IsA("Humanoid") then
+                if key == "WalkSpeed" and real_props.WalkSpeed[self] then return 16 end
+                if key == "JumpPower" and real_props.JumpPower[self] then return 50 end
+            end
+            return value
+        end))
+        local oldNewIndex
+        oldNewIndex = hookmetamethod(game, "__newindex", newcclosure(function(self, key, value)
+            if typeof(self) == "Instance" and self:IsA("Humanoid") then
+                if key == "WalkSpeed" then real_props.WalkSpeed[self] = value end
+                if key == "JumpPower" then real_props.JumpPower[self] = value end
+            end
+            return oldNewIndex(self, key, value)
+        end))
+    end
+
+    local function disableDetectionConnections()
+        if not has(getconnections) then return end
+        local LP = game:GetService("Players").LocalPlayer
+        local function disableSignal(signal)
+            if not signal then return end
+            local ok, conns = pcall(getconnections, signal)
+            if not ok then return end
+            for _, conn in ipairs(conns) do
+                local fn = conn.Function
+                if fn then
+                    local info = safe_call(debug.info, fn, "s")
+                    if type(info) == "string" and looksLikeAC(info) then
+                        safe_call(function() conn:Disable() end)
+                    end
+                end
+            end
+        end
+        local char = LP.Character or LP.CharacterAdded:Wait()
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            disableSignal(hum:GetPropertyChangedSignal("WalkSpeed"))
+            disableSignal(hum:GetPropertyChangedSignal("JumpPower"))
+            disableSignal(hum:GetPropertyChangedSignal("PlatformStand"))
+        end
+    end
+
+    function Bypass.enable()
+        if not Bypass_Enabled then return 0, 0 end
+        scanGC()
+        killACThreads()
+        classifyRemotes()
+        hookNamecall()
+        hookProperties()
+        disableDetectionConnections()
+        task.spawn(function()
+            while task.wait(3) do
+                scanGC()
+                killACThreads()
+                classifyRemotes()
+            end
+        end)
+        return disabled_threads, (function()
+            local n = 0
+            for _ in pairs(ac_remotes) do n = n + 1 end
+            return n
+        end)()
+    end
+
+    function Bypass.safeParent()
+        if has(gethui) then
+            local ok, h = pcall(gethui)
+            if ok and h then return h end
+        end
+        return game:GetService("CoreGui")
+    end
+end
+
+local acThreads, acRemotes = Bypass.enable()
 
 -- ============================================================
 -- CONFIG
 -- ============================================================
 local Config = {
-    -- workspace
     EggContainer     = workspace,
     PenFolder        = workspace,
     TreadmillFolder  = workspace,
 
-    -- scan
     EggKeywords      = {"egg", "nest", "crate"},
     PromptKeywords   = {"egg", "steal", "pickup", "take"},
     RemoteKeywords   = {"egg", "steal", "pick", "grab", "hatch", "place", "sell", "treadmill", "buy"},
@@ -22,18 +213,27 @@ local Config = {
     HatchKeywords    = {"hatch", "open"},
     PlaceKeywords    = {"place", "equip"},
 
-    -- behavior
-    StealDelay       = 0.15,
-    FarmCycleDelay   = 0.3,
-    MinValueFilter   = 0,        -- $/s minimum, 0 = semua
-    SpeedValue       = 28,
-    JumpValue        = 60,
+    SpeedValue       = 18,
+    JumpValue        = 52,
     RestoreSpeed     = 16,
     RestoreJump      = 50,
-    AutoReturnBase   = true,
-    BaseCFrame       = nil,      -- di-set pas startup / tombol "Set Base"
 
-    -- visual
+    StealDelay       = 0.6,
+    FarmCycleDelay   = 1.0,
+    MinValueFilter   = 0,
+
+    Stealth = {
+        Enabled        = true,
+        MaxTPDistance  = 80,
+        SettleTime     = 0.35,
+        PerEggCooldown = 1.5,
+        GlobalCooldown = 0.6,
+        MinFireRange   = 12,
+        PauseNearPlayer = 40,
+    },
+
+    BaseCFrame       = nil,
+
     AccentColor      = Color3.fromRGB(90, 255, 150),
     BgColor          = Color3.fromRGB(14, 14, 18),
     PanelColor       = Color3.fromRGB(22, 22, 28),
@@ -43,41 +243,34 @@ local Config = {
 -- ============================================================
 -- SERVICES
 -- ============================================================
-local Players          = game:GetService("Players")
-local RunService       = game:GetService("RunService")
-local TweenService     = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
-local VirtualUser      = game:GetService("VirtualUser")
-local CoreGui          = game:GetService("CoreGui")
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local TweenService      = game:GetService("TweenService")
+local UserInputService  = game:GetService("UserInputService")
+local VirtualUser       = game:GetService("VirtualUser")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService   = game:GetService("TeleportService")
+local HttpService       = game:GetService("HttpService")
 local LP = Players.LocalPlayer
 
 -- ============================================================
 -- STATE
 -- ============================================================
 local State = {
-    AutoSteal      = false,
-    AutoFarm       = false,
-    AutoFarmIndex  = false,
-    AutoHatch      = false,
-    AutoPlace      = false,
-    AutoSell       = false,
-    AutoTreadmill  = false,
-    EggESP         = false,
-    PlayerESP      = false,
-    Speed          = false,
-    Jump           = false,
-    Fly            = false,
-    Noclip         = false,
-    AntiAFK        = true,
-    InstantPrompt  = true,
+    AutoSteal = false, AutoFarm = false, AutoFarmIndex = false,
+    AutoHatch = false, AutoPlace = false, AutoSell = false, AutoTreadmill = false,
+    EggESP = false, PlayerESP = false,
+    Speed = false, Jump = false, Fly = false, Noclip = false,
+    AntiAFK = true, InstantPrompt = true,
 }
 
-local Selected   = {}      -- egg name -> true
-local EggCache   = {}      -- list of {obj, part, name, rarity, income, value, content}
-local StolenSet  = {}
-local RemoteMap  = {}      -- keyword -> RemoteEvent/RemoteFunction
-local FarmIndex  = 0
+local Selected  = {}
+local EggCache  = {}
+local StolenSet = {}
+local RemoteMap = {}
+local FarmIndex = 0
+local lastEggSteal    = {}
+local lastGlobalSteal = 0
 
 -- ============================================================
 -- HELPERS
@@ -107,26 +300,22 @@ end
 
 local function getEggPart(obj)
     if obj:IsA("BasePart") then return obj end
-    return obj.PrimaryPart
-        or obj:FindFirstChild("HumanoidRootPart")
+    return obj.PrimaryPart or obj:FindFirstChild("HumanoidRootPart")
         or obj:FindFirstChildWhichIsA("BasePart")
 end
 
 -- ============================================================
--- DEEP REMOTE SCANNER
+-- REMOTE SCANNER
 -- ============================================================
 local function scanRemotes()
     RemoteMap = {}
-    local ok, desc = pcall(function()
-        return ReplicatedStorage:GetDescendants()
-    end)
+    local ok, desc = pcall(function() return ReplicatedStorage:GetDescendants() end)
     if not ok then return end
     for _, obj in ipairs(desc) do
         if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
             local ln = obj.Name:lower()
             for _, kw in ipairs(Config.RemoteKeywords) do
                 if ln:find(kw, 1, true) then
-                    -- simpan yang pertama ketemu per keyword, prioritaskan nama pendek
                     if not RemoteMap[kw] or #obj.Name < #RemoteMap[kw].Name then
                         RemoteMap[kw] = obj
                     end
@@ -140,29 +329,21 @@ local function callRemote(keyword, ...)
     local r = RemoteMap[keyword]
     if not r then return false end
     local args = {...}
-    local ok = pcall(function()
-        if r:IsA("RemoteFunction") then
-            r:InvokeServer(unpack(args))
-        else
-            r:FireServer(unpack(args))
-        end
+    return pcall(function()
+        if r:IsA("RemoteFunction") then r:InvokeServer(unpack(args))
+        else r:FireServer(unpack(args)) end
     end)
-    return ok
 end
 
 -- ============================================================
--- EGG INFO — rarity + income dari attribute/child
+-- EGG INFO
 -- ============================================================
-local ValueKeys = {"income", "value", "worth", "price", "cash", "money", "persecond", "per_second"}
+local ValueKeys  = {"income", "value", "worth", "price", "cash", "money", "persecond", "per_second"}
 local RarityKeys = {"rarity", "tier", "rank", "grade", "class"}
 local ContentKeys = {"content", "pet", "reward", "inside", "hatch", "contains"}
 
 local function readEggInfo(obj)
-    local info = {
-        obj = obj, name = obj.Name, rarity = "Common",
-        income = 0, content = "?", part = getEggPart(obj),
-    }
-    -- attributes
+    local info = {obj=obj, name=obj.Name, rarity="Common", income=0, content="?", part=getEggPart(obj)}
     if obj.GetAttributes then
         for k, v in pairs(obj:GetAttributes()) do
             local lk = k:lower()
@@ -173,11 +354,11 @@ local function readEggInfo(obj)
             if nameMatchesAny(lk, ContentKeys) then info.content = tostring(v) end
         end
     end
-    -- children
     for _, c in ipairs(obj:GetDescendants()) do
         if c:IsA("NumberValue") or c:IsA("IntValue") then
-            local ln = c.Name:lower()
-            if nameMatchesAny(ln, ValueKeys) then info.income = math.max(info.income, c.Value) end
+            if nameMatchesAny(c.Name:lower(), ValueKeys) then
+                info.income = math.max(info.income, c.Value)
+            end
         elseif c:IsA("StringValue") then
             local ln = c.Name:lower()
             if nameMatchesAny(ln, RarityKeys) then info.rarity = c.Value end
@@ -202,12 +383,28 @@ local function refreshEggCache()
 end
 
 -- ============================================================
--- NOTIF
+-- PLAYER PROXIMITY
 -- ============================================================
+local function otherPlayersNear(radius)
+    local hrp = getHRP()
+    if not hrp then return false end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP and plr.Character then
+            local o = plr.Character:FindFirstChild("HumanoidRootPart")
+            if o and (o.Position - hrp.Position).Magnitude < radius then return true end
+        end
+    end
+    return false
+end
+
+-- ============================================================
+-- NOTIF (di gethui)
+-- ============================================================
+local HUIParent = Bypass.safeParent()
 local notifGui = Instance.new("ScreenGui")
 notifGui.Name = "IdzamNotif"
 notifGui.ResetOnSpawn = false
-notifGui.Parent = CoreGui
+notifGui.Parent = HUIParent
 
 local function notify(text)
     local box = Instance.new("TextLabel")
@@ -226,25 +423,21 @@ local function notify(text)
     task.delay(2.5, function()
         local tw = TweenService:Create(box, TweenInfo.new(0.4),
             { BackgroundTransparency = 1, TextTransparency = 1 })
-        tw:Play()
-        tw.Completed:Wait()
-        box:Destroy()
+        tw:Play() tw.Completed:Wait() box:Destroy()
     end)
 end
 
 -- ============================================================
--- ESP
+-- ESP (di gethui)
 -- ============================================================
 local eggEspFolder    = Instance.new("Folder")
 local playerEspFolder = Instance.new("Folder")
 eggEspFolder.Name    = "IdzamEggESP"
 playerEspFolder.Name = "IdzamPlayerESP"
-eggEspFolder.Parent    = CoreGui
-playerEspFolder.Parent = CoreGui
+eggEspFolder.Parent    = HUIParent
+playerEspFolder.Parent = HUIParent
 
-local function clearFolder(f)
-    for _, c in ipairs(f:GetChildren()) do c:Destroy() end
-end
+local function clearFolder(f) for _, c in ipairs(f:GetChildren()) do c:Destroy() end end
 
 local function makeBillboard(parent, adornee, text, color, subtext)
     local bb = Instance.new("BillboardGui")
@@ -253,7 +446,6 @@ local function makeBillboard(parent, adornee, text, color, subtext)
     bb.StudsOffset = Vector3.new(0, 3, 0)
     bb.AlwaysOnTop = true
     bb.Parent = parent
-
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(1, 0, 1, 0)
     frame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
@@ -261,7 +453,6 @@ local function makeBillboard(parent, adornee, text, color, subtext)
     frame.BorderSizePixel = 0
     frame.Parent = bb
     local fc = Instance.new("UICorner") fc.CornerRadius = UDim.new(0, 6) fc.Parent = frame
-
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(1, -8, 0.6, 0)
     lbl.Position = UDim2.new(0, 4, 0, 2)
@@ -274,7 +465,6 @@ local function makeBillboard(parent, adornee, text, color, subtext)
     lbl.Font = Enum.Font.GothamBold
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     lbl.Parent = frame
-
     if subtext then
         local sub = Instance.new("TextLabel")
         sub.Size = UDim2.new(1, -8, 0.35, 0)
@@ -287,7 +477,6 @@ local function makeBillboard(parent, adornee, text, color, subtext)
         sub.TextXAlignment = Enum.TextXAlignment.Left
         sub.Parent = frame
     end
-    return bb
 end
 
 local function renderEggESP()
@@ -295,9 +484,9 @@ local function renderEggESP()
     if not State.EggESP then return end
     for _, e in ipairs(EggCache) do
         if e.part and e.part.Parent then
-            local txt = string.format("%s  [%s]", e.name, e.rarity)
-            local sub = string.format("$%d/s  |  %s", e.income, e.content)
-            makeBillboard(eggEspFolder, e.part, txt, Config.AccentColor, sub)
+            makeBillboard(eggEspFolder, e.part,
+                string.format("%s [%s]", e.name, e.rarity), Config.AccentColor,
+                string.format("$%d/s | %s", e.income, e.content))
         end
     end
 end
@@ -313,32 +502,41 @@ local function renderPlayerESP()
     end
 end
 
-task.spawn(function()
-    while task.wait(1) do
-        refreshEggCache()
-        if State.EggESP then renderEggESP() end
-    end
-end)
-
-task.spawn(function()
-    while task.wait(1) do
-        if State.PlayerESP then renderPlayerESP() end
-    end
-end)
+task.spawn(function() while task.wait(1) do
+    refreshEggCache()
+    if State.EggESP then renderEggESP() end
+end end)
+task.spawn(function() while task.wait(1) do
+    if State.PlayerESP then renderPlayerESP() end
+end end)
 
 -- ============================================================
--- TELEPORT / INTERACT
+-- TELEPORT (stealth)
 -- ============================================================
-local function tpTo(pos, instant)
+local function tpStealth(targetPos)
     local hrp = getHRP()
-    if not hrp then return end
-    local cf = CFrame.new(pos + Vector3.new(0, 3, 0))
-    if instant then hrp.CFrame = cf
-    else
-        TweenService:Create(hrp,
-            TweenInfo.new(0.12, Enum.EasingStyle.Linear),
-            { CFrame = cf }):Play()
+    if not hrp then return false end
+    if not Config.Stealth.Enabled then
+        hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
+        return true
     end
+    local dist = (targetPos - hrp.Position).Magnitude
+    if dist > Config.Stealth.MaxTPDistance then
+        local hops = math.ceil(dist / Config.Stealth.MaxTPDistance)
+        for i = 1, hops do
+            local hrp2 = getHRP()
+            if not hrp2 then return false end
+            local remaining = (targetPos - hrp2.Position).Magnitude
+            local step = math.min(Config.Stealth.MaxTPDistance, remaining)
+            local dir = (targetPos - hrp2.Position).Unit
+            hrp2.CFrame = CFrame.new(hrp2.Position + dir * step + Vector3.new(0, 3, 0))
+            task.wait(0.2)
+        end
+    else
+        hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
+    end
+    task.wait(Config.Stealth.SettleTime)
+    return true
 end
 
 local function firePrompts(obj)
@@ -358,12 +556,11 @@ local function firePrompts(obj)
 end
 
 -- ============================================================
--- STEAL ENGINE — prompt dulu, remote sebagai fallback
+-- STEAL ENGINE
 -- ============================================================
 local function eggAllowed(info)
     if info.income < Config.MinValueFilter then return false end
-    local anySelected = next(Selected) ~= nil
-    if anySelected then return Selected[info.name] == true end
+    if next(Selected) ~= nil then return Selected[info.name] == true end
     return true
 end
 
@@ -382,17 +579,27 @@ end
 
 local function stealEgg(info)
     if not info or not info.part or not info.part.Parent then return false end
-    tpTo(info.part.Position, true)
-    task.wait(0.08)
+    if Config.Stealth.Enabled then
+        local now = os.clock()
+        if now - lastGlobalSteal < Config.Stealth.GlobalCooldown then return false end
+        if now - (lastEggSteal[info.name] or 0) < Config.Stealth.PerEggCooldown then return false end
+    end
+    tpStealth(info.part.Position)
+    local hrp = getHRP()
+    if not hrp then return false end
+    if Config.Stealth.Enabled
+    and (info.part.Position - hrp.Position).Magnitude > Config.Stealth.MinFireRange then
+        return false
+    end
     firePrompts(info.obj)
-    -- fallback remote
     if not info.obj:FindFirstChildWhichIsA("ProximityPrompt", true) then
         for _, kw in ipairs({"steal", "egg", "pick"}) do
-            if RemoteMap[kw] then
-                callRemote(kw, info.name)
-                break
-            end
+            if RemoteMap[kw] then callRemote(kw, info.name) break end
         end
+    end
+    if Config.Stealth.Enabled then
+        lastEggSteal[info.name] = os.clock()
+        lastGlobalSteal = os.clock()
     end
     StolenSet[info.name] = (StolenSet[info.name] or 0) + 1
     return true
@@ -404,9 +611,11 @@ end
 task.spawn(function()
     while task.wait(Config.StealDelay) do
         if State.AutoSteal then
-            refreshEggCache()
-            local e = nearestAllowedEgg()
-            if e then stealEgg(e) end
+            if not (Config.Stealth.Enabled and otherPlayersNear(Config.Stealth.PauseNearPlayer)) then
+                refreshEggCache()
+                local e = nearestAllowedEgg()
+                if e then stealEgg(e) end
+            end
         end
     end
 end)
@@ -414,9 +623,11 @@ end)
 task.spawn(function()
     while task.wait(Config.FarmCycleDelay) do
         if State.AutoFarm then
-            refreshEggCache()
-            local e = nearestAllowedEgg()
-            if e then stealEgg(e) end
+            if not (Config.Stealth.Enabled and otherPlayersNear(Config.Stealth.PauseNearPlayer)) then
+                refreshEggCache()
+                local e = nearestAllowedEgg()
+                if e then stealEgg(e) end
+            end
         end
     end
 end)
@@ -424,17 +635,17 @@ end)
 task.spawn(function()
     while task.wait(Config.FarmCycleDelay) do
         if State.AutoFarmIndex then
-            refreshEggCache()
-            local picked
-            for i = FarmIndex + 1, #EggCache do
-                local e = EggCache[i]
-                if e.part and e.part.Parent and eggAllowed(e) then
-                    picked = e
-                    FarmIndex = i
-                    break
+            if not (Config.Stealth.Enabled and otherPlayersNear(Config.Stealth.PauseNearPlayer)) then
+                refreshEggCache()
+                local picked
+                for i = FarmIndex + 1, #EggCache do
+                    local e = EggCache[i]
+                    if e.part and e.part.Parent and eggAllowed(e) then
+                        picked = e FarmIndex = i break
+                    end
                 end
+                if picked then stealEgg(picked) else FarmIndex = 0 end
             end
-            if picked then stealEgg(picked) else FarmIndex = 0 end
         end
     end
 end)
@@ -444,9 +655,8 @@ end)
 -- ============================================================
 local function tryHatch()
     for _, kw in ipairs({"hatch", "open"}) do
-        if RemoteMap[kw] then callRemote(kw); return true end
+        if RemoteMap[kw] then callRemote(kw) return true end
     end
-    -- prompt di pen
     for _, d in ipairs(Config.PenFolder:GetDescendants()) do
         if d:IsA("ProximityPrompt") and nameMatchesAny(d.Name, Config.HatchKeywords) then
             pcall(function()
@@ -460,14 +670,14 @@ end
 
 local function tryPlace()
     for _, kw in ipairs({"place", "equip"}) do
-        if RemoteMap[kw] then callRemote(kw); return true end
+        if RemoteMap[kw] then callRemote(kw) return true end
     end
     return false
 end
 
 local function trySell()
     for _, kw in ipairs({"sell", "cashout", "collect"}) do
-        if RemoteMap[kw] then callRemote(kw, "all"); return true end
+        if RemoteMap[kw] then callRemote(kw, "all") return true end
     end
     for _, d in ipairs(workspace:GetDescendants()) do
         if d:IsA("ProximityPrompt") and nameMatchesAny(d.Name, Config.SellKeywords) then
@@ -482,7 +692,7 @@ end
 
 local function tryTreadmill()
     for _, kw in ipairs({"treadmill"}) do
-        if RemoteMap[kw] then callRemote(kw); return true end
+        if RemoteMap[kw] then callRemote(kw) return true end
     end
     return false
 end
@@ -493,7 +703,7 @@ task.spawn(function() while task.wait(3) do if State.AutoSell then trySell() end
 task.spawn(function() while task.wait(2) do if State.AutoTreadmill then tryTreadmill() end end end)
 
 -- ============================================================
--- MOVEMENT
+-- MOVEMENT (tanpa BodyMover — CFrame loop)
 -- ============================================================
 local function applySpeed()
     local h = getHumanoid()
@@ -501,72 +711,44 @@ local function applySpeed()
 end
 local function applyJump()
     local h = getHumanoid()
-    if h then
-        h.UseJumpPower = true
-        h.JumpPower = State.Jump and Config.JumpValue or Config.RestoreJump
-    end
+    if h then h.UseJumpPower = true
+        h.JumpPower = State.Jump and Config.JumpValue or Config.RestoreJump end
 end
+LP.CharacterAdded:Connect(function() task.wait(1) applySpeed() applyJump() end)
 
-LP.CharacterAdded:Connect(function()
-    task.wait(1)
-    applySpeed() applyJump()
-end)
-
--- fly
-local flyBV, flyBG
+-- fly pakai CFrame step, bukan BodyVelocity
+local flyConn
 local function setFly(on)
-    local hrp = getHRP()
-    if not hrp then return end
-    if on then
-        if not flyBV then
-            flyBV = Instance.new("BodyVelocity")
-            flyBV.Velocity = Vector3.zero
-            flyBV.MaxForce = Vector3.new(1e5, 1e5, 1e5)
-            flyBV.Parent = hrp
+    if flyConn then flyConn:Disconnect() flyConn = nil end
+    if not on then return end
+    local runSvc = RunService
+    flyConn = runSvc.RenderStepped:Connect(function(dt)
+        if not State.Fly then return end
+        local hrp = getHRP()
+        if not hrp then return end
+        local cam = workspace.CurrentCamera
+        local move = getHumanoid() and getHumanoid().MoveDirection or Vector3.zero
+        local dir = Vector3.zero
+        if move.Magnitude > 0 then
+            dir = cam.CFrame:VectorToWorldSpace(Vector3.new(move.X, 0, move.Z))
         end
-        if not flyBG then
-            flyBG = Instance.new("BodyGyro")
-            flyBG.MaxTorque = Vector3.new(1e5, 1e5, 1e5)
-            flyBG.P = 1000 flyBG.D = 50
-            flyBG.CFrame = hrp.CFrame
-            flyBG.Parent = hrp
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir = dir + Vector3.new(0, 1, 0) end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then dir = dir - Vector3.new(0, 1, 0) end
+        if dir.Magnitude > 0 then
+            hrp.CFrame = hrp.CFrame + dir.Unit * 60 * dt
         end
-        task.spawn(function()
-            while State.Fly and flyBV and flyBV.Parent do
-                local cam = workspace.CurrentCamera
-                local move = getHumanoid() and getHumanoid().MoveDirection or Vector3.zero
-                local dir = Vector3.zero
-                if move.Magnitude > 0 then
-                    dir = cam.CFrame:VectorToWorldSpace(Vector3.new(move.X, 0, move.Z)) * 60
-                end
-                if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir = dir + Vector3.new(0, 60, 0) end
-                if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then dir = dir - Vector3.new(0, 60, 0) end
-                flyBV.Velocity = dir
-                flyBG.CFrame = cam.CFrame
-                task.wait()
-            end
-        end)
-    else
-        if flyBV then flyBV:Destroy() flyBV = nil end
-        if flyBG then flyBG:Destroy() flyBG = nil end
-    end
+    end)
 end
 
--- noclip
-task.spawn(function()
-    while task.wait(0.2) do
-        if State.Noclip then
-            local char = LP.Character
-            if char then
-                for _, p in ipairs(char:GetDescendants()) do
-                    if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
-                end
-            end
-        end
+task.spawn(function() while task.wait(0.2) do
+    if State.Noclip then
+        local char = LP.Character
+        if char then for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+        end end
     end
-end)
+end end)
 
--- anti afk
 LP.Idled:Connect(function()
     if State.AntiAFK then
         VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
@@ -580,28 +762,22 @@ end)
 -- ============================================================
 local function setBase()
     local hrp = getHRP()
-    if hrp then
-        Config.BaseCFrame = hrp.CFrame
-        notify("base di-set")
-    end
+    if hrp then Config.BaseCFrame = hrp.CFrame notify("base di-set") end
 end
-
 local function tpBase()
     if Config.BaseCFrame then
         local hrp = getHRP()
         if hrp then hrp.CFrame = Config.BaseCFrame + Vector3.new(0, 3, 0) end
-    else
-        notify("base belum di-set")
-    end
+    else notify("base belum di-set") end
 end
 
 -- ============================================================
--- UI — TAB-BASED DARK GLASS
+-- UI (di gethui)
 -- ============================================================
 local ui = Instance.new("ScreenGui")
 ui.Name = "IdzamCh3atzUI"
 ui.ResetOnSpawn = false
-ui.Parent = CoreGui
+ui.Parent = HUIParent
 
 local main = Instance.new("Frame")
 main.Size = UDim2.new(0, 340, 0, 500)
@@ -613,7 +789,6 @@ main.Parent = ui
 local mc = Instance.new("UICorner") mc.CornerRadius = UDim.new(0, 12) mc.Parent = main
 local ms = Instance.new("UIStroke") ms.Color = Config.AccentColor ms.Thickness = 1 ms.Transparency = 0.3 ms.Parent = main
 
--- header
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, 0, 0, 42)
 header.BackgroundTransparency = 1
@@ -622,14 +797,13 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -24, 1, 0)
 title.Position = UDim2.new(0, 16, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "IDZAM CH3ATZ"
+title.Text = "IDZAM CH3ATZ v5"
 title.TextColor3 = Config.AccentColor
 title.Font = Enum.Font.GothamBold
 title.TextSize = 17
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = header
 
--- tab bar
 local tabBar = Instance.new("Frame")
 tabBar.Size = UDim2.new(1, -24, 0, 30)
 tabBar.Position = UDim2.new(0, 12, 0, 44)
@@ -640,7 +814,6 @@ tabLayout.FillDirection = Enum.FillDirection.Horizontal
 tabLayout.Padding = UDim.new(0, 4)
 tabLayout.Parent = tabBar
 
--- content
 local content = Instance.new("Frame")
 content.Size = UDim2.new(1, -24, 1, -122)
 content.Position = UDim2.new(0, 12, 0, 80)
@@ -648,8 +821,6 @@ content.BackgroundTransparency = 1
 content.Parent = main
 
 local pages = {}
-local currentPage
-
 local function newPage(name)
     local page = Instance.new("ScrollingFrame")
     page.Size = UDim2.new(1, 0, 1, 0)
@@ -674,8 +845,6 @@ end
 local function showPage(name)
     for _, p in pairs(pages) do p.Visible = false end
     if pages[name] then pages[name].Visible = true end
-    currentPage = name
-    -- update tab highlight
     for _, btn in ipairs(tabBar:GetChildren()) do
         if btn:IsA("TextButton") then
             btn.TextColor3 = (btn.Name == name) and Config.AccentColor or Color3.fromRGB(120, 120, 130)
@@ -697,7 +866,6 @@ local function addTab(name)
     btn.Parent = tabBar
     local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, 6) c.Parent = btn
     btn.MouseButton1Click:Connect(function() showPage(name) end)
-    return btn
 end
 
 local function addToggle(page, label, key, onChanged)
@@ -726,7 +894,6 @@ local function addToggle(page, label, key, onChanged)
         end
         if onChanged then onChanged() end
     end)
-    return btn
 end
 
 local function addButton(page, label, color, onClick)
@@ -743,16 +910,15 @@ local function addButton(page, label, color, onClick)
     btn.Parent = page
     local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, 6) c.Parent = btn
     btn.MouseButton1Click:Connect(onClick)
-    return btn
 end
 
 -- ============================================================
 -- PAGES
 -- ============================================================
-local farmPage = newPage("Farm")
-local eggPage  = newPage("Eggs")
+local farmPage   = newPage("Farm")
+local eggPage    = newPage("Eggs")
 local playerPage = newPage("Player")
-local miscPage = newPage("Misc")
+local miscPage   = newPage("Misc")
 
 addToggle(farmPage, "Auto Steal", "AutoSteal")
 addToggle(farmPage, "Auto Farm (loop)", "AutoFarm")
@@ -761,16 +927,13 @@ addToggle(farmPage, "Auto Hatch", "AutoHatch")
 addToggle(farmPage, "Auto Place", "AutoPlace")
 addToggle(farmPage, "Auto Sell", "AutoSell")
 addToggle(farmPage, "Auto Treadmill", "AutoTreadmill")
-
 addButton(farmPage, "Set Base (current pos)", Color3.fromRGB(40, 60, 90), setBase)
 addButton(farmPage, "Teleport to Base", Color3.fromRGB(40, 60, 90), tpBase)
 
--- egg page
-local scanBtn = addButton(eggPage, "Scan Eggs (deep)", Color3.fromRGB(60, 40, 90), function()
+addButton(eggPage, "Scan Eggs (deep)", Color3.fromRGB(60, 40, 90), function()
     refreshEggCache()
-    notify(string.format("%d egg | %d remote ketemu", #EggCache, (function()
-        local n = 0 for _ in pairs(RemoteMap) do n = n + 1 end return n
-    end)()))
+    local n = 0 for _ in pairs(RemoteMap) do n = n + 1 end
+    notify(string.format("%d egg | %d remote", #EggCache, n))
     buildEggList()
 end)
 
@@ -807,7 +970,7 @@ function buildEggList()
         row.Font = Enum.Font.Gotham
         row.TextSize = 10
         row.TextXAlignment = Enum.TextXAlignment.Left
-        row.Text = string.format("  %s  ·  %s  ·  $%d/s", e.name, e.rarity, e.income)
+        row.Text = string.format("  %s · %s · $%d/s", e.name, e.rarity, e.income)
         row.AutoButtonColor = false
         row.Parent = eggScroll
         local rc = Instance.new("UICorner") rc.CornerRadius = UDim.new(0, 4) rc.Parent = row
@@ -821,19 +984,15 @@ function buildEggList()
 end
 
 addButton(eggPage, "Clear Selection", Color3.fromRGB(70, 30, 30), function()
-    Selected = {}
-    buildEggList()
-    notify("selection cleared")
+    Selected = {} buildEggList() notify("selection cleared")
 end)
 
--- min value input
 local minFrame = Instance.new("Frame")
 minFrame.Size = UDim2.new(1, 0, 0, 32)
 minFrame.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
 minFrame.BorderSizePixel = 0
 minFrame.Parent = eggPage
 local mfc = Instance.new("UICorner") mfc.CornerRadius = UDim.new(0, 6) mfc.Parent = minFrame
-
 local minBox = Instance.new("TextBox")
 minBox.Size = UDim2.new(1, -8, 1, -4)
 minBox.Position = UDim2.new(0, 4, 0, 2)
@@ -849,17 +1008,15 @@ minBox.FocusLost:Connect(function()
     notify("min income = $" .. Config.MinValueFilter .. "/s")
 end)
 
--- player page
 addToggle(playerPage, "Speed", "Speed", applySpeed)
 addToggle(playerPage, "Jump", "Jump", applyJump)
-addToggle(playerPage, "Fly", "Fly", function() setFly(State.Fly) end)
+addToggle(playerPage, "Fly (CFrame)", "Fly", function() setFly(State.Fly) end)
 addToggle(playerPage, "Noclip", "Noclip")
 addToggle(playerPage, "Anti-AFK", "AntiAFK")
 addToggle(playerPage, "Instant Prompt", "InstantPrompt")
 addToggle(playerPage, "Egg ESP", "EggESP", function() renderEggESP() end)
 addToggle(playerPage, "Player ESP", "PlayerESP", function() renderPlayerESP() end)
 
--- misc
 addButton(miscPage, "Rescan Remotes", Color3.fromRGB(50, 50, 70), function()
     scanRemotes()
     local n = 0 for _ in pairs(RemoteMap) do n = n + 1 end
@@ -867,10 +1024,11 @@ addButton(miscPage, "Rescan Remotes", Color3.fromRGB(50, 50, 70), function()
 end)
 addButton(miscPage, "Server Hop", Color3.fromRGB(50, 50, 70), function()
     local ok, res = pcall(function()
-        return game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100")
+        return game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId
+            .. "/servers/Public?sortOrder=Asc&limit=100")
     end)
     if not ok then notify("hop gagal") return end
-    local ok2, data = pcall(function() return game:GetService("HttpService"):JSONDecode(res) end)
+    local ok2, data = pcall(function() return HttpService:JSONDecode(res) end)
     if not ok2 then notify("hop gagal") return end
     for _, s in ipairs(data.data or {}) do
         if s.id ~= game.JobId and s.playing < s.maxPlayers then
@@ -881,13 +1039,9 @@ addButton(miscPage, "Server Hop", Color3.fromRGB(50, 50, 70), function()
     notify("server penuh / gagal")
 end)
 
--- ============================================================
--- TABS
--- ============================================================
 addTab("Farm") addTab("Eggs") addTab("Player") addTab("Misc")
 showPage("Farm")
 
--- drag
 local dragging, dragStart, startPos
 header.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
@@ -915,6 +1069,6 @@ scanRemotes()
 refreshEggCache()
 buildEggList()
 applySpeed() applyJump()
-notify(string.format("v3 loaded — %d egg | %d remote", #EggCache, (function()
-    local n = 0 for _ in pairs(RemoteMap) do n = n + 1 end return n
-end)()))
+local nRemotes = 0 for _ in pairs(RemoteMap) do nRemotes = nRemotes + 1 end
+notify(string.format("v5 — %d egg | %d remote | AC %d thread / %d remote",
+    #EggCache, nRemotes, acThreads or 0, acRemotes or 0))
