@@ -1,11 +1,9 @@
 --[[
-    Idzam Ch3atz v5 — Steal An Egg
-    target : Roblox, executor (Delta / Xeno / Wave / Solara / Krnl / Synapse)
-    require: getgc, hookmetamethod, hookfunction, newcclosure, getconnections, gethui
-    catatan: kalau executor lu gak punya salah satu fungsi di atas, blok bypass
-             otomatis di-skip — script tetap jalan tanpa bypass itu.
-    mode   : stealth + bypass aktif default. set Config.Stealth.Enabled = false
-             dan Bypass_Enabled = false kalau main di private server sendiri.
+    Idzam Ch3atz v5.1 — Steal An Egg
+    target : Roblox, executor high-end (Wave / MacSploit / Volt / Potassium)
+    note   : script ini WAJIB pakai executor yang support getgc & hookmetamethod.
+             kalau pakai Delta/Fluxus gratisan, bypass bakal di-skip dan Error 267
+             bakal tetep muncul.
 ]]
 
 -- ============================================================
@@ -61,7 +59,6 @@ do
     end
 
     local disabled_threads = 0
-
     local function scanGC()
         if not has(getgc) then return end
         local ok, gc = pcall(getgc, true)
@@ -92,12 +89,16 @@ do
     local ac_remotes = {}
     local function classifyRemotes()
         local RS = game:GetService("ReplicatedStorage")
+        -- agresif: hapus remote yang namanya jelas-jelas AC
         local ok, desc = pcall(function() return RS:GetDescendants() end)
         if not ok then return end
         for _, obj in ipairs(desc) do
-            if (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction"))
-                and looksLikeAC(obj.Name) then
-                ac_remotes[obj] = true
+            if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
+                if looksLikeAC(obj.Name) then
+                    ac_remotes[obj] = true
+                    -- coba hancurkan parent-nya biar script AC gak bisa akses
+                    pcall(function() obj.Parent = nil end)
+                end
             end
         end
     end
@@ -117,7 +118,6 @@ do
     end
 
     local real_props = { WalkSpeed = {}, JumpPower = {} }
-
     local function hookProperties()
         if not has(hookmetamethod) then return end
         local oldIndex
@@ -161,7 +161,6 @@ do
         if hum then
             disableSignal(hum:GetPropertyChangedSignal("WalkSpeed"))
             disableSignal(hum:GetPropertyChangedSignal("JumpPower"))
-            disableSignal(hum:GetPropertyChangedSignal("PlatformStand"))
         end
     end
 
@@ -218,18 +217,18 @@ local Config = {
     RestoreSpeed     = 16,
     RestoreJump      = 50,
 
-    StealDelay       = 0.6,
-    FarmCycleDelay   = 1.0,
+    StealDelay       = 0.8,
+    FarmCycleDelay   = 1.2,
     MinValueFilter   = 0,
 
     Stealth = {
         Enabled        = true,
         MaxTPDistance  = 80,
-        SettleTime     = 0.35,
-        PerEggCooldown = 1.5,
-        GlobalCooldown = 0.6,
-        MinFireRange   = 12,
-        PauseNearPlayer = 40,
+        SettleTime     = 0.15,
+        PerEggCooldown = 2.0,
+        GlobalCooldown = 0.8,
+        MinFireRange   = 15,
+        PauseNearPlayer = 45,
     },
 
     BaseCFrame       = nil,
@@ -511,7 +510,7 @@ task.spawn(function() while task.wait(1) do
 end end)
 
 -- ============================================================
--- TELEPORT (stealth)
+-- TELEPORT (Lerp — anti velocity check)
 -- ============================================================
 local function tpStealth(targetPos)
     local hrp = getHRP()
@@ -520,17 +519,17 @@ local function tpStealth(targetPos)
         hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
         return true
     end
-    local dist = (targetPos - hrp.Position).Magnitude
-    if dist > Config.Stealth.MaxTPDistance then
-        local hops = math.ceil(dist / Config.Stealth.MaxTPDistance)
-        for i = 1, hops do
+    local startPos = hrp.Position
+    local distance = (targetPos - startPos).Magnitude
+    
+    if distance > 30 then
+        local t = 0
+        while t < 1 do
             local hrp2 = getHRP()
             if not hrp2 then return false end
-            local remaining = (targetPos - hrp2.Position).Magnitude
-            local step = math.min(Config.Stealth.MaxTPDistance, remaining)
-            local dir = (targetPos - hrp2.Position).Unit
-            hrp2.CFrame = CFrame.new(hrp2.Position + dir * step + Vector3.new(0, 3, 0))
-            task.wait(0.2)
+            t = t + 0.15
+            hrp2.CFrame = CFrame.new(startPos):Lerp(CFrame.new(targetPos + Vector3.new(0, 3, 0)), math.min(t, 1))
+            task.wait()
         end
     else
         hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
@@ -703,7 +702,7 @@ task.spawn(function() while task.wait(3) do if State.AutoSell then trySell() end
 task.spawn(function() while task.wait(2) do if State.AutoTreadmill then tryTreadmill() end end end)
 
 -- ============================================================
--- MOVEMENT (tanpa BodyMover — CFrame loop)
+-- MOVEMENT (CFrame loop)
 -- ============================================================
 local function applySpeed()
     local h = getHumanoid()
@@ -716,13 +715,11 @@ local function applyJump()
 end
 LP.CharacterAdded:Connect(function() task.wait(1) applySpeed() applyJump() end)
 
--- fly pakai CFrame step, bukan BodyVelocity
 local flyConn
 local function setFly(on)
     if flyConn then flyConn:Disconnect() flyConn = nil end
     if not on then return end
-    local runSvc = RunService
-    flyConn = runSvc.RenderStepped:Connect(function(dt)
+    flyConn = RunService.RenderStepped:Connect(function(dt)
         if not State.Fly then return end
         local hrp = getHRP()
         if not hrp then return end
@@ -797,7 +794,7 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -24, 1, 0)
 title.Position = UDim2.new(0, 16, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "IDZAM CH3ATZ v5"
+title.Text = "IDZAM CH3ATZ v5.1"
 title.TextColor3 = Config.AccentColor
 title.Font = Enum.Font.GothamBold
 title.TextSize = 17
@@ -1070,5 +1067,5 @@ refreshEggCache()
 buildEggList()
 applySpeed() applyJump()
 local nRemotes = 0 for _ in pairs(RemoteMap) do nRemotes = nRemotes + 1 end
-notify(string.format("v5 — %d egg | %d remote | AC %d thread / %d remote",
+notify(string.format("v5.1 — %d egg | %d remote | AC %d / %d",
     #EggCache, nRemotes, acThreads or 0, acRemotes or 0))
